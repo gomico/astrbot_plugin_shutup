@@ -260,13 +260,14 @@ class GroupCardUpdater:
                     restore_result: RestoreResult = "updated"
                     # 先 update(0) 恢复昵称，此时 store 还有 original_card
                     if event is not None:
-                        await self.update(event, origin, 0)
+                        restore_result = await self.update(event, origin, 0)
                     elif target is not None:
                         restore_result = await self.update_target(origin, target, 0)
                     else:
                         self.origin_to_event_map.pop(origin, None)
                         self.origin_to_target_map.pop(origin, None)
 
+                    # 恢复失败时保留 store 与映射，下一轮（60s 后）继续重试
                     if restore_result == "retry":
                         continue
 
@@ -291,15 +292,16 @@ class GroupCardUpdater:
         origin: str,
         remaining_minutes: int | None,
         status: GroupCardStatus = "muted",
-    ) -> None:
+    ) -> RestoreResult:
         if not self._plugin.group_card_enabled:
-            return
+            return "skipped"
 
         is_active_status = remaining_minutes is None or remaining_minutes > 0
         if is_active_status:
             self.origin_to_event_map[origin] = event
             self.ensure_started()
 
+        retry_needed = False
         try:
             try:
                 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (  # noqa: E501
@@ -307,23 +309,23 @@ class GroupCardUpdater:
                 )
             except ImportError:
                 logger.debug("[Shutup] aiocqhttp 模块未安装，跳过群昵称更新")
-                return
+                return "skipped"
 
             if not isinstance(event, AiocqhttpMessageEvent):
-                return
+                return "skipped"
 
             group_id = event.get_group_id()
             if not group_id:
-                return
+                return "skipped"
 
             bot = getattr(event, "bot", None)
             if not bot or not hasattr(bot, "call_action"):
                 logger.debug("[Shutup] bot 不支持 call_action，跳过群昵称更新")
-                return
+                return "skipped"
 
             self_id = event.get_self_id()
             if not self_id:
-                return
+                return "skipped"
 
             original_card, original_nick = self._get_original_identity(origin)
 
@@ -369,18 +371,28 @@ class GroupCardUpdater:
             else:
                 card = original_card
 
-            await bot.call_action(
-                "set_group_card",
-                group_id=int(group_id),
-                user_id=int(self_id),
-                card=card[:60],
-            )
+            try:
+                await bot.call_action(
+                    "set_group_card",
+                    group_id=int(group_id),
+                    user_id=int(self_id),
+                    card=card[:60],
+                )
+            except Exception as e:
+                # 恢复失败不能当成恢复成功：保留 origin 映射与原始名片，
+                # 交给 _update_loop 下一轮重试。
+                retry_needed = not is_active_status
+                logger.warning(f"[Shutup] 更新群昵称失败: {e}")
+                return "retry"
             logger.info(f"[Shutup] 已更新群昵称({status}): {card[:60]}")
+            return "updated"
 
         except Exception as e:
+            retry_needed = not is_active_status
             logger.warning(f"[Shutup] 更新群昵称失败: {e}")
+            return "retry"
         finally:
-            if not is_active_status:
+            if not is_active_status and not retry_needed:
                 self.origin_to_event_map.pop(origin, None)
                 self.origin_to_target_map.pop(origin, None)
                 self._original_identity_cache.pop(origin, None)
@@ -420,6 +432,7 @@ class GroupCardUpdater:
         else:
             card = original_card
 
+        restored = False
         try:
             await target.bot.call_action(
                 "set_group_card",
@@ -428,12 +441,13 @@ class GroupCardUpdater:
                 card=card[:60],
             )
             logger.info(f"[Shutup] 已恢复群昵称状态({status}): {card[:60]}")
+            restored = True
             return "updated"
         except Exception as e:
             logger.warning(f"[Shutup] 从持久化记录恢复群昵称失败: {e}")
             return "retry"
         finally:
-            if not is_active_status:
+            if not is_active_status and restored:
                 self.origin_to_event_map.pop(origin, None)
                 self.origin_to_target_map.pop(origin, None)
                 self._original_identity_cache.pop(origin, None)
